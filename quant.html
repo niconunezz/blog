@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <title>núñez's Blog</title>
+        <link rel="icon" href="favicon.ico" type="image/x-icon">
+        <link rel="stylesheet" type="text/css" href="style.css">
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.7/MathJax.js?config=TeX-MML-AM_CHTML"></script>
+        <script type="text/x-mathjax-config">
+            MathJax.Hub.Config({
+                tex2jax: {inlineMath: [['$','$']]}
+            });
+        </script>
+    </head>
+
+    <body>
+        <div class="header" id="nav"><a class="link" href="index.html">núñez's blog</a></div>
+        <div class="container" id="main">
+            <h1>4-Bit Quantization: Precision Dequantization Techniques for GEMMs</h1>
+            
+            <h2>Credits and Introduction</h2>
+            <div>
+                First, I want to acknowledge fpgaminer's work, as this implementation is based on their code from <a href="https://github.com/fpgaminer/GPTQ-triton/blob/main/src/gptq_triton/quant_linear.py#L55">GPTQ-triton</a>. In this post, we'll explore how to efficiently handle quantized matrices in deep learning, focusing on a specific case: performing matrix multiplication between a float16 matrix A and a quantized int32 matrix B that packs 4-bit values.
+            </div>
+
+            <h2>Understanding Quantization</h2>
+            <div>
+                Before diving into dequantization, let's understand how quantization works. The process involves converting high-precision numbers (like float16) into lower-precision formats (like 4-bit integers) while preserving as much information as possible.
+            </div>
+
+            <h3>Group-wise Quantization</h3>
+            <div>
+                The quantization process involves calculating two key values for each group:
+                <ul>
+                    <li>Scale = $\frac{max(original) - min(original)}{max(quantized) - min(quantized)}  $</li>
+                    <li>Zeros = $min(original)$</li>
+                </ul>
+                For example, converting $[-5.5, 4, 9, 3.4]$ to 4-bit unsigned integers (range 0-15):
+                <div class="code">
+                    <code>
+                        scale = (9 - (-5.5)) / (15 - 0) ≈ 0.97<br>
+                        Zeros = -5.5
+                    </code>
+                </div>
+
+                The quantization formula is:
+                <div style="text-align: center;">
+                    $q = round(\frac{x - zeros}{scale})$
+                </div>
+
+                Applying this to our example gives us: $[0, 10, 15, 9]$
+            </div>
+
+            <h3>Grouping Strategy</h3>
+            <div>
+                When quantizing matrices, we don't calculate scale and zeros for the entire matrix at once. Instead, we group similar values together to minimize precision loss. Column-wise grouping typically provides the best results since features for each token are stored in columns, making their values have a similar scale. However, this is massively expensive due to the common row-wise memory layout. (See <a href="https://giahuy04.medium.com/global-memory-coalescing-37a6f9d7e314">memory-coalescing</a>).
+
+                In our implementation, as we don't deal with quantization, we use column-wise partitioning, where scales and zeros have shape (1, N). If quantization is desired, one way to achieve it efficiently and without losing too much precision is by using 2D block-tiling, which involves dividing the matrix into rectangles.  
+                For more details: <a href=" https://pytorch.org/blog/accelerating-gemms-triton/?utm_content=318580331&utm_medium=social&utm_source=linkedin&hss_channel=lcp-78618366">GridQuant </a>
+            </div>
+
+            <h2>The Challenge: Packed Values</h2>
+            <div>
+                Our quantized values come packed in int32 format, with each int32 storing eight 4-bit numbers $(32//4)$. Let's understand this with a simpler example using int16 packing four 4-bit numbers:
+
+                Consider the number $1001$ $1000$ $1101$ $1111$ ($39135$ in decimal). We interpret this as four separate values: $(9, 8, 13, 15)$
+
+                To extract these values, we use bit-wise operations:
+                <li>1. Shift the desired 4 bits to the rightmost position</li>
+                <li>2. Apply a mask to clear unwanted bits</li>
+
+                Example: To extract the second value ($1000$):
+                <div class="code">
+                    <code>
+                        n = 1001 1000 1101 1111<br>
+                        shifted_n = n >> 8<br>
+                        print(shifted_n ) -> 0000 0000 1001 1000<br>
+                         mask = 0000 0000 0000 1111<br>
+                        unpacked = mask & shifted_n = 0000 0000 0000 1000<br>
+                        print(unpacked) -> 0000 0000 0000 1000<br>
+                    </code>
+                </div>
+            </div>
+
+            <h2>Implementation Details</h2>
+            <div>
+                Our implementation works with:
+                <ul>
+                    <li>A: shape (M, K) in float16</li>
+                    <li>B: shape (K//8, N) in int32 (packed 4-bit values)</li>
+                    <li>C: shape (M, N) in float16</li>
+                    <li>scales: shape (1, N) in float16</li>
+                    <li>zeros: shape (1, N//8) in int32 (packed values)</li>
+                </ul>
+            </div>
+
+            <h2>Differences with Standard GEMM Implementation</h2>
+            <div>
+                Assuming familiarity with standard GEMM implementations in Triton, let's analyze the key differences in our quantized version.
+
+                The first significant change is how we handle matrix B's values. Since each int32 value packs eight 4-bit elements, accessing the first eight rows of the actual matrix means accessing just the first row of matrix B. This affects how we calculate our pointers:
+
+                <div class="code">
+                    <code >
+                        b_ptrs = b_ptr + (off_k[:, None]//8)*stride_bk + off_bn[None,:]
+                    </code>
+                </div>
+
+                Before entering the main loop, we need to load scales and zeros. Remember that zeros is also quantized, requiring special handling:
+
+                <div class="code">
+                    <code>
+                        sc = tl.load(scales_ptr + tl.arange(0, Bc))<br>
+                        z = tl.load(zeros_ptr + off_bn//8)
+                    </code>
+                </div>
+
+                We calculate bit shifts for both the values and zeros:
+
+                <div class="code">
+                    <code>
+                        shift = (off_k % 8)*4<br>
+                        shift_zeros = (off_bn % 8)*4
+                    </code>
+                </div>
+
+                Then, we extract the actual zero values:
+
+                <div class="code">
+                    <code>
+                        z = (z >> shift_zeros)& 0xF<br>
+                        z = (z + 1) * sc # (1, N), float16
+                        
+                    </code>
+                </div>
+
+                Finally, inside the main loop, we unpack and scale the values from B:
+
+                <div class="code">
+                    <code>
+                        b = (b >> shift) & 0xF <br>
+                        b = b*sc + z # scale b, float16
+                        
+                    </code>
+                </div>
+
+                These modifications allow us to efficiently work with quantized values while maintaining the overall GEMM structure.
+            </div>
+
+
+        </div>
+    </body>
+</html>
